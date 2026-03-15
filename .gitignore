@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Key and secrets directory (default key location)
+.env/
+
+# Evidence files and decrypted output (may contain sensitive data)
+*.evidence
+*.zip
+*.pem
+
+# Allow committed test fixtures
+!tests/fixtures/test.evidence
+!tests/fixtures/test_key.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Pytest
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
