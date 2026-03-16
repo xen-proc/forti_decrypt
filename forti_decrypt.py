@@ -6,11 +6,13 @@ import base64
 import dataclasses
 import getpass
 import hmac as stdlib_hmac
+import io
 import os
 import re
 import sys
+import zipfile
 from pathlib import Path
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.hmac import HMAC
@@ -113,15 +115,37 @@ def _verify_mac(file_key: bytes, header_bytes: bytes) -> bytes:
     return h.finalize()
 
 
+_STREAM_CHUNK_PLAINTEXT = 64 * 1024
+_STREAM_CHUNK_CIPHERTEXT = _STREAM_CHUNK_PLAINTEXT + 16  # + GCM tag
+
+
 def _decrypt_payload(file_key: bytes, payload: bytes) -> bytes:
-    """Derive payload key via HKDF and decrypt with AES-256-GCM."""
+    """Derive payload key via HKDF and decrypt with AES-256-GCM (STREAM chunks)."""
     nonce_salt = payload[:16]
     ciphertext = payload[16:]
     payload_key = HKDF(
         algorithm=hashes.SHA256(), length=32, salt=nonce_salt, info=b"payload"
     ).derive(file_key)
-    gcm_nonce = b"\x00" * 11 + b"\x01"
-    return AESGCM(payload_key).decrypt(gcm_nonce, ciphertext, None)
+    aesgcm = AESGCM(payload_key)
+
+    parts = []
+    offset = 0
+    counter = 0
+    total = len(ciphertext)
+    while offset < total:
+        chunk = ciphertext[offset : offset + _STREAM_CHUNK_CIPHERTEXT]
+        offset += _STREAM_CHUNK_CIPHERTEXT
+        is_last = offset >= total
+        nonce = counter.to_bytes(11, "big") + (b"\x01" if is_last else b"\x00")
+        parts.append(aesgcm.decrypt(nonce, chunk, None))
+        counter += 1
+    return b"".join(parts)
+
+
+def _zip_entries(data: bytes) -> List[Tuple[str, int]]:
+    """Return list of (filename, uncompressed_size) from a ZIP."""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return [(zi.filename, zi.file_size) for zi in zf.infolist()]
 
 
 def decrypt_evidence_bytes(
@@ -185,6 +209,16 @@ def decrypt_evidence(
     return result
 
 
+def _resolve_key_path(cli_key: Optional[str]) -> str:
+    """Resolve key path: --key arg > FORTI_KEY env var > default."""
+    if cli_key is not None:
+        return cli_key
+    env_key = os.environ.get("FORTI_KEY")
+    if env_key:
+        return env_key
+    return ".env/decrypted_key.pem"
+
+
 def _resolve_key_password(
     key_pem: bytes,
     cli_password: Optional[str],
@@ -213,14 +247,22 @@ def main():
     )
     parser.add_argument(
         "--key",
-        default=".env/decrypted_key.pem",
-        help="RSA private key PEM file (default: .env/decrypted_key.pem)",
+        default=None,
+        help=(
+            "RSA private key PEM file "
+            "(default: FORTI_KEY env var, or .env/decrypted_key.pem)"
+        ),
     )
 
     out_group = parser.add_mutually_exclusive_group()
     out_group.add_argument(
         "--output",
-        help="Output path (default: <evidence_stem>.zip). Only for single file.",
+        help="Output path for the decrypted ZIP. Single file only.",
+    )
+    out_group.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        help="Directory for output ZIPs when processing multiple files.",
     )
     out_group.add_argument(
         "--stdout",
@@ -231,6 +273,20 @@ def main():
         "--verify-only",
         action="store_true",
         help="Verify decryption succeeds without writing any output.",
+    )
+    out_group.add_argument(
+        "--list",
+        action="store_true",
+        help="List ZIP contents without writing any output.",
+    )
+
+    parser.add_argument(
+        "--extract",
+        action="store_true",
+        help=(
+            "Extract ZIP contents to a directory instead of saving a .zip file. "
+            "Output goes to <stem>/ or <output-dir>/<stem>/."
+        ),
     )
 
     parser.add_argument(
@@ -256,36 +312,80 @@ def main():
         "--verbose",
         "-v",
         action="store_true",
-        help="Print fingerprint, stanza count, and debug info per file.",
+        help="Print fingerprint, stanza count, ZIP contents, and debug info per file.",
     )
 
     args = parser.parse_args()
 
     if args.output and len(args.evidence_files) > 1:
         parser.error("--output can only be used with a single evidence file")
+    if args.extract and (args.stdout or args.verify_only or args.list):
+        parser.error("--extract cannot be combined with --stdout, --verify-only, or --list")
 
-    key_pem = Path(args.key).read_bytes()
-    key_password = _resolve_key_password(key_pem, args.key_password, args.key, args.key_password_file)
+    key_path = _resolve_key_path(args.key)
+    key_pem = Path(key_path).read_bytes()
+    key_password = _resolve_key_password(key_pem, args.key_password, key_path, args.key_password_file)
+
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     errors: List[tuple] = []
 
     for evidence_file in args.evidence_files:
         stem = Path(evidence_file).stem
-        out = None if (args.stdout or args.verify_only) else (args.output or f"{stem}.zip")
-
         try:
-            result = decrypt_evidence(evidence_file, args.key, out, key_password=key_password)
+            result = decrypt_evidence(evidence_file, key_path, key_password=key_password)
 
             if args.stdout:
                 sys.stdout.buffer.write(result.data)
-            elif not args.quiet:
-                if args.verify_only:
-                    msg = f"OK: {evidence_file} (fingerprint: {result.matched_fingerprint})"
-                else:
-                    msg = f"Decrypted: {evidence_file} -> {out}"
+                continue
+
+            if args.verify_only:
+                if not args.quiet:
+                    print(f"OK: {evidence_file} (fingerprint: {result.matched_fingerprint})")
+                continue
+
+            entries = _zip_entries(result.data)
+
+            if args.list:
+                print(f"{evidence_file}:")
+                for name, size in entries:
+                    print(f"  {name}  ({size:,} bytes)")
+                continue
+
+            if args.extract:
+                base = Path(args.output_dir) if args.output_dir else Path(".")
+                extract_dir = base / stem
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(result.data)) as zf:
+                    zf.extractall(extract_dir)
+                if not args.quiet:
+                    msg = f"Extracted: {evidence_file} -> {extract_dir}/"
                     if args.verbose:
                         msg += f" (fingerprint: {result.matched_fingerprint}, stanzas: {result.stanza_count})"
+                    print(msg)
+                if args.verbose:
+                    for name, size in entries:
+                        print(f"  {name}  ({size:,} bytes)")
+                continue
+
+            # Default: write ZIP
+            if args.output:
+                out = args.output
+            elif args.output_dir:
+                out = str(Path(args.output_dir) / f"{stem}.zip")
+            else:
+                out = f"{stem}.zip"
+
+            Path(out).write_bytes(result.data)
+            if not args.quiet:
+                msg = f"Decrypted: {evidence_file} -> {out}"
+                if args.verbose:
+                    msg += f" (fingerprint: {result.matched_fingerprint}, stanzas: {result.stanza_count})"
                 print(msg)
+            if args.verbose:
+                for name, size in entries:
+                    print(f"  {name}  ({size:,} bytes)")
 
         except Exception as exc:
             if args.verbose:
@@ -295,7 +395,11 @@ def main():
 
     if errors:
         for path, err in errors:
-            print(f"Error: {path}: {err}", file=sys.stderr)
+            err_type = type(err).__name__
+            print(
+                f"Error: {path}: {err_type}: {err}" if str(err) else f"Error: {path}: {err_type}",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
 

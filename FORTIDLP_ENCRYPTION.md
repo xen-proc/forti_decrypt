@@ -2,8 +2,6 @@
 
 FortiDLP encrypts captured evidence using a custom variant of the [age encryption format](https://github.com/C2SP/C2SP/blob/main/age.md). The format identifier is `age.reveal.avasecurity.com/v1` (vs standard age's `age-encryption.org/v1`).
 
-For CLI and library usage see [README.md](README.md).
-
 ## How FortiDLP Encrypts Evidence
 
 ### 1. Collect Evidence into a ZIP
@@ -113,4 +111,3 @@ Splits the binary payload into the 16-byte HKDF salt (first 16 bytes) and the AE
 - **Format:** PEM-encoded private key (PKCS#8 or traditional)
 - **Fingerprint calculation:** `SHA-256(PKCS#1 DER-encoded public key)`, base64-encoded
 - **Padding scheme:** OAEP with SHA-256 hash + SHA-256 MGF1
-

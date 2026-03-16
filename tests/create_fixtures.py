@@ -85,13 +85,22 @@ def encrypt_fortidlp(plaintext: bytes, public_key) -> bytes:
 
     full_header = header_for_mac + f" {_b64_nopad(mac_bytes)}\n".encode("ascii")
 
-    # 6. AES-256-GCM payload: 16-byte HKDF salt + ciphertext
+    # 6. AES-256-GCM payload: 16-byte HKDF salt + STREAM chunks
     nonce_salt = os.urandom(16)
     payload_key = HKDF(
         algorithm=hashes.SHA256(), length=32, salt=nonce_salt, info=b"payload"
     ).derive(file_key)
-    gcm_nonce = b"\x00" * 11 + b"\x01"
-    ciphertext = AESGCM(payload_key).encrypt(gcm_nonce, plaintext, None)
+    aesgcm = AESGCM(payload_key)
+    chunk_size = 64 * 1024
+    chunks = [plaintext[i : i + chunk_size] for i in range(0, len(plaintext), chunk_size)]
+    if not chunks:
+        chunks = [b""]
+    ciphertext_parts = []
+    for counter, chunk in enumerate(chunks):
+        is_last = counter == len(chunks) - 1
+        nonce = counter.to_bytes(11, "big") + (b"\x01" if is_last else b"\x00")
+        ciphertext_parts.append(aesgcm.encrypt(nonce, chunk, None))
+    ciphertext = b"".join(ciphertext_parts)
 
     return full_header + nonce_salt + ciphertext
 
