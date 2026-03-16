@@ -8,12 +8,14 @@
 *.evidence
 *.zip
 *.pem
+evidence*/
+clipboard_*/
 
-# Allow committed test fixtures
+#Allow committed test fixtures
 !tests/fixtures/test.evidence
 !tests/fixtures/test_key.pem
 
-# Python
+# Python build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -23,6 +25,14 @@ build/
 
 # Pytest
 .pytest_cache/
+
+# AI agents
+.claude/
+.cursor/
+.codex/
+.gemini/
+.aider*
+AGENTS.md
 
 # Editors / OS
 .idea/
